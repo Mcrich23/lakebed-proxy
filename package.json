@@ -1,0 +1,17 @@
+{
+  "name": "lakebed-proxy",
+  "version": "0.1.0",
+  "description": "Run a local macOS-compatible HTTP proxy backed by a claimed Lakebed deployment.",
+  "type": "module",
+  "bin": {
+    "lakebed-proxy": "./bin/lakebed-proxy.js"
+  },
+  "scripts": {
+    "check": "node --check bin/lakebed-proxy.js"
+  },
+  "packageManager": "pnpm@10.32.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "license": "MIT"
+}
