@@ -33,7 +33,7 @@ HTTPS proxying requires a local certificate authority. `lakebed-proxy` creates o
 Trust it once:
 
 ```sh
-sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain "$HOME/.lakebed-proxy/ca/lakebed-proxy-ca.crt"
+security add-trusted-cert -d -r trustRoot -k ~/Library/Keychains/login.keychain-db "$HOME/.lakebed-proxy/ca/lakebed-proxy-ca.crt"
 ```
 
 Without this step, browsers and curl will reject HTTPS traffic through the proxy. For quick curl-only testing, you can use `curl -k`.

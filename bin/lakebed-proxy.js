@@ -172,7 +172,7 @@ async function assertCaTrustedForAuto() {
   }
   if (!(await isCaTrusted())) {
     throw new Error(
-      `--auto requires the generated HTTPS MITM CA to be trusted first.\n\nRun:\n  sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain ${quoteShell(CA_CERT_PATH)}\n\nThen rerun lakebed-proxy run --auto.`
+      `--auto requires the generated HTTPS MITM CA to be trusted first.\n\nRun:\n  security add-trusted-cert -d -r trustRoot -k ~/Library/Keychains/login.keychain-db ${quoteShell(CA_CERT_PATH)}\n\nThen rerun lakebed-proxy run --auto.`
     );
   }
 }
@@ -946,7 +946,7 @@ async function printReadyInstructions({ auto, deployId, deployUrl, urlChanged, h
   console.log(`HTTPS Proxy: ${host}:${port}`);
   console.log("");
   console.log("Trust the local CA for HTTPS MITM:");
-  console.log(`  sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain ${quoteShell(CA_CERT_PATH)}`);
+  console.log(`  security add-trusted-cert -d -r trustRoot -k ~/Library/Keychains/login.keychain-db ${quoteShell(CA_CERT_PATH)}`);
   console.log("");
   if (auto) {
     console.log("--auto is enabled: Wi-Fi proxy settings were applied and will be restored on shutdown.");
