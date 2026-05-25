@@ -6,6 +6,9 @@
   "bin": {
     "lakebed-proxy": "./bin/lakebed-proxy.js"
   },
+  "files": [
+    "bin"
+  ],
   "scripts": {
     "check": "node --check bin/lakebed-proxy.js"
   },
