@@ -9,13 +9,13 @@ Use Lakebed as the egress point for your Mac's HTTP and HTTPS traffic.
 Run from GitHub with npm:
 
 ```sh
-npx github:<owner>/lakebed-proxy run
+npx lakebed-proxy run
 ```
 
 Or with pnpm:
 
 ```sh
-pnpm dlx github:<owner>/lakebed-proxy run
+pnpm dlx lakebed-proxy run
 ```
 
 Replace `<owner>` with the GitHub owner for this repository.
