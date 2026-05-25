@@ -1,88 +1,108 @@
 # lakebed-proxy
 
-Run a local macOS-compatible HTTP proxy backed by a claimed Lakebed deployment.
+Use Lakebed as the egress point for your Mac's HTTP and HTTPS traffic.
 
-The CLI has one command:
+`lakebed-proxy` starts a local proxy on your machine, deploys a tiny Lakebed relay for you, and sends your proxied web requests through that Lakebed deployment. It can also configure your Wi-Fi proxy settings while it runs and put them back when you stop it.
+
+## Quick Start
+
+Run from GitHub with npm:
+
+```sh
+npx github:<owner>/lakebed-proxy run
+```
+
+Or with pnpm:
 
 ```sh
 pnpm dlx github:<owner>/lakebed-proxy run
 ```
 
-Replace `<owner>` with the GitHub owner or install from a local checkout:
+Replace `<owner>` with the GitHub owner for this repository.
+
+On the first run, Lakebed will open a claim page in your browser. Claim the deployment, return to the terminal, and the proxy will finish starting.
+
+## HTTPS Setup
+
+HTTPS proxying requires a local certificate authority. `lakebed-proxy` creates one at:
+
+```text
+~/.lakebed-proxy/ca/lakebed-proxy-ca.crt
+```
+
+Trust it once:
 
 ```sh
-pnpm link --global
+sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain "$HOME/.lakebed-proxy/ca/lakebed-proxy-ca.crt"
+```
+
+Without this step, browsers and curl will reject HTTPS traffic through the proxy. For quick curl-only testing, you can use `curl -k`.
+
+## Use It
+
+Start the proxy:
+
+```sh
 lakebed-proxy run
 ```
 
-## What `run` does
-
-Every run:
-
-1. Creates or refreshes a generated Lakebed capsule in `~/.lakebed-proxy/capsule`.
-2. Runs `pnpm dlx lakebed deploy` for that capsule.
-3. Opens the Lakebed claim flow on first use if outbound fetch is not enabled yet.
-4. Redeploys after claim so the server-side proxy route can fetch outbound HTTP.
-5. Records the latest deploy ID and URL in `~/.lakebed-proxy/state.json`.
-6. Starts a local proxy on `127.0.0.1:8080`.
-7. Generates a local MITM CA under `~/.lakebed-proxy/ca` so HTTPS can be proxied through Lakebed after you trust the CA.
-
-If Lakebed returns a different deploy URL, the CLI prints:
+By default it listens on:
 
 ```text
-Lakebed proxy URL changed: <old> -> <new>
+127.0.0.1:8080
 ```
 
-## macOS proxy setup
+The CLI prints the exact macOS commands to enable and disable the HTTP and HTTPS proxies for your active network service.
 
-Once the proxy is serving, the CLI prints commands like:
+To let the CLI manage Wi-Fi proxy settings for you:
 
 ```sh
-networksetup -setwebproxy "Wi-Fi" 127.0.0.1 8080
-networksetup -setsecurewebproxy "Wi-Fi" 127.0.0.1 8080
+lakebed-proxy run --auto
 ```
 
-It also prints matching undo commands:
+`--auto` requires the HTTPS CA to already be trusted. It saves your current Wi-Fi proxy settings, points Wi-Fi at `lakebed-proxy`, and restores the original settings when you stop the process.
+
+## Options
+
+```sh
+lakebed-proxy run [--host 127.0.0.1] [--port 8080] [--api https://api.lakebed.app] [--auto]
+```
+
+- `--host <host>`: local host to bind, default `127.0.0.1`
+- `--port <port>`: local port to bind, default `8080`
+- `--api <url>`: Lakebed API URL, default `https://api.lakebed.app`
+- `--auto`: set Wi-Fi web proxies while running and restore them on shutdown
+
+## How It Works
+
+- Every run deploys or refreshes a generated Lakebed capsule in `~/.lakebed-proxy/capsule`.
+- The current Lakebed deployment URL is saved in `~/.lakebed-proxy/state.json`.
+- HTTP requests are forwarded through Lakebed.
+- HTTPS requests are decrypted locally with your trusted `lakebed-proxy` CA, then forwarded through Lakebed.
+- If Lakebed returns a different deployment URL, the CLI tells you.
+
+## Notes
+
+- Apps with certificate pinning may reject the local HTTPS interception.
+- Request and response bodies are non-streaming and subject to Lakebed's payload limits.
+- `--auto` currently manages the `Wi-Fi` network service only.
+- If `--auto` cannot restore your settings, disable them manually:
 
 ```sh
 networksetup -setwebproxystate "Wi-Fi" off
 networksetup -setsecurewebproxystate "Wi-Fi" off
 ```
 
-The CLI only prints these commands. It does not modify system proxy settings itself.
-
-If you want the CLI to manage Wi-Fi proxy settings while it runs, use `--auto`:
+## Local Development
 
 ```sh
-lakebed-proxy run --auto
+npm link
+lakebed-proxy run
 ```
 
-`--auto` snapshots the current Wi-Fi HTTP and HTTPS proxy settings, sets both to the local `lakebed-proxy` listener, and restores the original settings on Ctrl-C or process shutdown. This mode requires the generated CA to already be trusted; if it is not trusted, the command exits before deploying or changing proxy settings.
-
-For HTTPS, the CLI also prints a command to trust its generated local CA:
+or:
 
 ```sh
-sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain "$HOME/.lakebed-proxy/ca/lakebed-proxy-ca.crt"
+pnpm link --global
+lakebed-proxy run
 ```
-
-Until that CA is trusted, browsers and curl will reject HTTPS sites proxied through `lakebed-proxy`. For one-off curl testing, `-k` can skip certificate verification.
-
-## Behavior
-
-- Plain HTTP proxy requests go through Lakebed.
-- HTTPS `CONNECT` requests are terminated locally with generated per-host certificates signed by the local CA, then relayed through Lakebed.
-- HTTPS is decrypted on your Mac before being sent through Lakebed, so certificate-pinned clients may fail.
-- HTTP responses are non-streaming and subject to Lakebed request and payload limits.
-
-## Flags
-
-The public command is `run`, with explicit flags for configuration:
-
-```sh
-lakebed-proxy run --host 127.0.0.1 --port 8081
-```
-
-- `--host <host>`: bind host, default `127.0.0.1`
-- `--port <port>`: bind port, default `8080`
-- `--api <url>`: Lakebed API URL, default `https://api.lakebed.app`
-- `--auto`: automatically configure Wi-Fi web proxies while running and restore them on shutdown

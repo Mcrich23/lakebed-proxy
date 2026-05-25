@@ -44,6 +44,7 @@ Flags:
   --help         Show this help.
 
 GitHub:
+  npx github:<owner>/lakebed-proxy run
   pnpm dlx github:<owner>/lakebed-proxy run
 
 Direct:
@@ -130,6 +131,15 @@ async function runOpenSsl(args) {
   return runCommand("openssl", args);
 }
 
+async function commandExists(command) {
+  try {
+    await runCommand("which", [command]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function caSha256Fingerprint() {
   const { stdout } = await runOpenSsl(["x509", "-in", CA_CERT_PATH, "-noout", "-fingerprint", "-sha256"]);
   return stdout.trim().replace(/^sha256 Fingerprint=/i, "").replaceAll(":", "").toUpperCase();
@@ -168,7 +178,11 @@ async function assertCaTrustedForAuto() {
 }
 
 async function runLakebed(args, { inherit = false } = {}) {
-  return runCommand("pnpm", ["dlx", "lakebed", ...args], { stdio: inherit ? "inherit" : "pipe" });
+  const stdio = inherit ? "inherit" : "pipe";
+  if (await commandExists("pnpm")) {
+    return runCommand("pnpm", ["dlx", "lakebed", ...args], { stdio });
+  }
+  return runCommand("npx", ["-y", "lakebed", ...args], { stdio });
 }
 
 async function deployCapsule(api) {

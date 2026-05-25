@@ -4,16 +4,17 @@ This repository ships the `lakebed-proxy` Node CLI.
 
 ## Commands
 
-Use pnpm for package commands:
+Use pnpm for repo package commands when available:
 
 ```sh
 pnpm run check
 ```
 
-The CLI itself invokes Lakebed with:
+The CLI invokes Lakebed with pnpm when available and falls back to npx:
 
 ```sh
 pnpm dlx lakebed ...
+npx -y lakebed ...
 ```
 
 ## Runtime Shape
