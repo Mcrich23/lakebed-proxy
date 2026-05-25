@@ -18,8 +18,6 @@ Or with pnpm:
 pnpm dlx lakebed-proxy run
 ```
 
-Replace `<owner>` with the GitHub owner for this repository.
-
 On the first run, Lakebed will open a claim page in your browser. Claim the deployment, return to the terminal, and the proxy will finish starting.
 
 ## HTTPS Setup
