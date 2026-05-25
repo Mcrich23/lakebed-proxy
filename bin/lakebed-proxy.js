@@ -3,6 +3,7 @@
 import { execFile, spawn } from "node:child_process";
 import { createServer } from "node:http";
 import net from "node:net";
+import tls from "node:tls";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
@@ -12,6 +13,11 @@ const DEFAULT_PORT = 8080;
 const DEFAULT_API = "https://api.lakebed.app";
 const CACHE_DIR = join(homedir(), ".lakebed-proxy");
 const CAPSULE_DIR = join(CACHE_DIR, "capsule");
+const CA_DIR = join(CACHE_DIR, "ca");
+const CERTS_DIR = join(CA_DIR, "certs");
+const CA_KEY_PATH = join(CA_DIR, "lakebed-proxy-ca.key");
+const CA_CERT_PATH = join(CA_DIR, "lakebed-proxy-ca.crt");
+const CA_SERIAL_PATH = join(CA_DIR, "lakebed-proxy-ca.srl");
 const STATE_PATH = join(CACHE_DIR, "state.json");
 const HOP_BY_HOP_HEADERS = new Set([
   "connection",
@@ -56,6 +62,15 @@ function nowIso() {
   return new Date().toISOString();
 }
 
+async function fileExists(path) {
+  try {
+    await readFile(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function readJson(path, fallback = null) {
   try {
     return JSON.parse(await readFile(path, "utf8"));
@@ -98,6 +113,10 @@ function runCommand(command, args, { stdio = "pipe" } = {}) {
       reject(error);
     });
   });
+}
+
+async function runOpenSsl(args) {
+  return runCommand("openssl", args);
 }
 
 async function runLakebed(args, { inherit = false } = {}) {
@@ -407,6 +426,138 @@ function responseHeadersFromRelay(headers, body) {
   return out;
 }
 
+function safeCertName(host) {
+  return Buffer.from(host.toLowerCase()).toString("base64url");
+}
+
+function isIpAddress(host) {
+  return net.isIP(host) !== 0;
+}
+
+function validateConnectHost(host) {
+  if (!host || host.length > 253) {
+    return false;
+  }
+  if (isIpAddress(host)) {
+    return true;
+  }
+  return /^[a-z0-9.-]+$/i.test(host) && !host.startsWith(".") && !host.endsWith(".");
+}
+
+async function ensureCa() {
+  await mkdir(CA_DIR, { recursive: true });
+  await mkdir(CERTS_DIR, { recursive: true });
+  if ((await fileExists(CA_KEY_PATH)) && (await fileExists(CA_CERT_PATH))) {
+    return;
+  }
+
+  console.log("Generating local lakebed-proxy MITM CA...");
+  await runOpenSsl(["genrsa", "-out", CA_KEY_PATH, "2048"]);
+  await runOpenSsl([
+    "req",
+    "-x509",
+    "-new",
+    "-nodes",
+    "-key",
+    CA_KEY_PATH,
+    "-sha256",
+    "-days",
+    "3650",
+    "-subj",
+    "/CN=lakebed-proxy local MITM CA",
+    "-out",
+    CA_CERT_PATH
+  ]);
+}
+
+function certConfigForHost(host) {
+  const altKind = isIpAddress(host) ? "IP" : "DNS";
+  return `[req]
+distinguished_name=req_distinguished_name
+req_extensions=v3_req
+prompt=no
+
+[req_distinguished_name]
+CN=${host}
+
+[v3_req]
+subjectAltName=@alt_names
+
+[alt_names]
+${altKind}.1=${host}
+`;
+}
+
+async function ensureHostCert(host) {
+  await ensureCa();
+  const name = safeCertName(host);
+  const keyPath = join(CERTS_DIR, `${name}.key`);
+  const certPath = join(CERTS_DIR, `${name}.crt`);
+  const csrPath = join(CERTS_DIR, `${name}.csr`);
+  const configPath = join(CERTS_DIR, `${name}.conf`);
+
+  if ((await fileExists(keyPath)) && (await fileExists(certPath))) {
+    return { cert: await readFile(certPath), key: await readFile(keyPath) };
+  }
+
+  await writeFile(configPath, certConfigForHost(host));
+  await runOpenSsl(["genrsa", "-out", keyPath, "2048"]);
+  await runOpenSsl(["req", "-new", "-key", keyPath, "-out", csrPath, "-config", configPath]);
+  await runOpenSsl([
+    "x509",
+    "-req",
+    "-in",
+    csrPath,
+    "-CA",
+    CA_CERT_PATH,
+    "-CAkey",
+    CA_KEY_PATH,
+    "-CAserial",
+    CA_SERIAL_PATH,
+    "-CAcreateserial",
+    "-out",
+    certPath,
+    "-days",
+    "825",
+    "-sha256",
+    "-extensions",
+    "v3_req",
+    "-extfile",
+    configPath
+  ]);
+
+  return { cert: await readFile(certPath), key: await readFile(keyPath) };
+}
+
+async function relayRequestThroughLakebed({ bodyMaxBytes, lakebedClient, protocol, req, res, targetHost }) {
+  const started = Date.now();
+  const target = protocol === "https:" ? new URL(req.url || "/", `https://${targetHost}`) : parseProxyTarget(req);
+  if (!target) {
+    writePlain(res, 400, "Expected an absolute http:// URL in proxy request.\n");
+    return;
+  }
+
+  try {
+    const body = await collectRequestBody(req, bodyMaxBytes);
+    const result = await lakebedClient.runMutation("relay", [
+      {
+        method: req.method,
+        url: target.toString(),
+        headers: cleanRequestHeaders(req.headers),
+        bodyBase64: bufferToBase64(body)
+      }
+    ]);
+    const responseBody = base64ToBuffer(result.bodyBase64);
+    res.writeHead(Number(result.status) || 502, result.statusText || undefined, responseHeadersFromRelay(result.headers, responseBody));
+    res.end(responseBody);
+    console.log(`${req.method} ${target} -> ${result.status}${result.error ? ` ${result.error}` : ""} ${Date.now() - started}ms lakebed`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Lakebed relay failed.";
+    writePlain(res, 502, `${message}\n`);
+    console.log(`${req.method} ${target} -> 502 ${message} ${Date.now() - started}ms lakebed`);
+  }
+}
+
 class LakebedMutationClient {
   constructor(deployUrl) {
     this.deployUrl = deployUrl;
@@ -510,69 +661,83 @@ class LakebedMutationClient {
 }
 
 async function handleHttpProxy(req, res, lakebedClient) {
-  const started = Date.now();
-  const target = parseProxyTarget(req);
-  if (!target) {
-    writePlain(res, 400, "Expected an absolute http:// URL in proxy request.\n");
-    return;
-  }
-
-  try {
-    const body = await collectRequestBody(req);
-    const result = await lakebedClient.runMutation("relay", [
-      {
-        method: req.method,
-        url: target.toString(),
-        headers: cleanRequestHeaders(req.headers),
-        bodyBase64: bufferToBase64(body)
-      }
-    ]);
-    const responseBody = base64ToBuffer(result.bodyBase64);
-    res.writeHead(Number(result.status) || 502, result.statusText || undefined, responseHeadersFromRelay(result.headers, responseBody));
-    res.end(responseBody);
-    console.log(`${req.method} ${target} -> ${result.status}${result.error ? ` ${result.error}` : ""} ${Date.now() - started}ms lakebed`);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "Lakebed relay failed.";
-    writePlain(res, 502, `${message}\n`);
-    console.log(`${req.method} ${target} -> 502 ${message} ${Date.now() - started}ms lakebed`);
-  }
+  await relayRequestThroughLakebed({
+    bodyMaxBytes: 2 * 1024 * 1024,
+    lakebedClient,
+    protocol: "http:",
+    req,
+    res,
+    targetHost: ""
+  });
 }
 
-function handleConnect(req, clientSocket, head) {
+async function handleConnect(req, clientSocket, head, mitmHttpServer) {
   const started = Date.now();
   const [host, portText = "443"] = String(req.url || "").split(":");
   const port = Number(portText);
-  if (!host || !Number.isInteger(port) || port < 1 || port > 65535) {
+  if (!validateConnectHost(host) || !Number.isInteger(port) || port < 1 || port > 65535) {
     clientSocket.write("HTTP/1.1 400 Bad Request\r\n\r\n");
     clientSocket.destroy();
     return;
   }
 
-  const upstream = net.connect(port, host, () => {
-    clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
-    if (head?.length) {
-      upstream.write(head);
-    }
-    upstream.pipe(clientSocket);
-    clientSocket.pipe(upstream);
-    console.log(`CONNECT ${host}:${port} -> tunnel ${Date.now() - started}ms local`);
-  });
+  if (port !== 443) {
+    clientSocket.write("HTTP/1.1 403 Forbidden\r\n\r\nlakebed-proxy MITM only supports CONNECT to port 443.\n");
+    clientSocket.destroy();
+    console.log(`CONNECT ${host}:${port} -> 403 unsupported port ${Date.now() - started}ms mitm`);
+    return;
+  }
 
-  upstream.on("error", (error) => {
+  try {
+    const { cert, key } = await ensureHostCert(host);
+    const secureContext = tls.createSecureContext({ cert, key });
+    clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+    const tlsSocket = new tls.TLSSocket(clientSocket, {
+      ALPNProtocols: ["http/1.1"],
+      isServer: true,
+      secureContext
+    });
+
+    tlsSocket.on("error", (error) => {
+      console.log(`CONNECT ${host}:${port} -> TLS ${error.message} ${Date.now() - started}ms mitm`);
+    });
+    if (head?.length) {
+      tlsSocket.unshift(head);
+    }
+    tlsSocket.once("secure", () => {
+      tlsSocket.lakebedProxyTargetHost = host;
+      mitmHttpServer.emit("connection", tlsSocket);
+      console.log(`CONNECT ${host}:${port} -> mitm ${Date.now() - started}ms lakebed`);
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unable to create MITM certificate.";
     if (!clientSocket.destroyed) {
       clientSocket.write("HTTP/1.1 502 Bad Gateway\r\n\r\n");
       clientSocket.destroy();
     }
-    console.log(`CONNECT ${host}:${port} -> 502 ${error.message} ${Date.now() - started}ms local`);
-  });
+    console.log(`CONNECT ${host}:${port} -> 502 ${message} ${Date.now() - started}ms mitm`);
+  }
 }
 
 function startProxyServer({ host, port, deployUrl }) {
   const lakebedClient = new LakebedMutationClient(deployUrl);
+  const mitmHttpServer = createServer((req, res) => {
+    const targetHost = req.socket.lakebedProxyTargetHost;
+    void relayRequestThroughLakebed({
+      bodyMaxBytes: 2 * 1024 * 1024,
+      lakebedClient,
+      protocol: "https:",
+      req,
+      res,
+      targetHost
+    });
+  });
   const server = createServer((req, res) => {
     void handleHttpProxy(req, res, lakebedClient);
   });
-  server.on("connect", handleConnect);
+  server.on("connect", (req, socket, head) => {
+    void handleConnect(req, socket, head, mitmHttpServer);
+  });
   return new Promise((resolve, reject) => {
     server.once("error", reject);
     server.listen(port, host, () => {
@@ -624,6 +789,9 @@ async function printReadyInstructions({ deployId, deployUrl, urlChanged, host, p
   console.log(`HTTP Proxy:  ${host}:${port}`);
   console.log(`HTTPS Proxy: ${host}:${port}`);
   console.log("");
+  console.log("Trust the local CA for HTTPS MITM:");
+  console.log(`  sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain ${quoteShell(CA_CERT_PATH)}`);
+  console.log("");
   if (!service) {
     console.log("I could not detect your active macOS network service. Replace <service> below with something like Wi-Fi.");
     console.log("List services with: networksetup -listallnetworkservices");
@@ -637,7 +805,7 @@ async function printReadyInstructions({ deployId, deployUrl, urlChanged, host, p
   console.log(`  networksetup -setwebproxystate ${quotedService} off`);
   console.log(`  networksetup -setsecurewebproxystate ${quotedService} off`);
   console.log("");
-  console.log("HTTP requests go through Lakebed. HTTPS uses a local CONNECT tunnel.");
+  console.log("HTTP and HTTPS requests go through Lakebed. HTTPS is decrypted locally with the generated CA.");
   console.log("Press Ctrl-C to stop the local proxy.");
 }
 
@@ -710,6 +878,7 @@ async function run(options) {
 
   const previousState = await readJson(STATE_PATH);
   const state = await ensureClaimedDeploy(previousState, api);
+  await ensureCa();
   await startProxyServer({ host, port, deployUrl: state.url });
   await printReadyInstructions({ deployId: state.deployId, deployUrl: state.url, urlChanged: state.urlChanged, host, port });
 }

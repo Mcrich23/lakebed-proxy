@@ -25,6 +25,7 @@ Every run:
 4. Redeploys after claim so the server-side proxy route can fetch outbound HTTP.
 5. Records the latest deploy ID and URL in `~/.lakebed-proxy/state.json`.
 6. Starts a local proxy on `127.0.0.1:8080`.
+7. Generates a local MITM CA under `~/.lakebed-proxy/ca` so HTTPS can be proxied through Lakebed after you trust the CA.
 
 If Lakebed returns a different deploy URL, the CLI prints:
 
@@ -50,11 +51,19 @@ networksetup -setsecurewebproxystate "Wi-Fi" off
 
 The CLI only prints these commands. It does not modify system proxy settings itself.
 
+For HTTPS, the CLI also prints a command to trust its generated local CA:
+
+```sh
+sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain "$HOME/.lakebed-proxy/ca/lakebed-proxy-ca.crt"
+```
+
+Until that CA is trusted, browsers and curl will reject HTTPS sites proxied through `lakebed-proxy`. For one-off curl testing, `-k` can skip certificate verification.
+
 ## Behavior
 
 - Plain HTTP proxy requests go through Lakebed.
-- HTTPS uses a local `CONNECT` tunnel from your Mac to the destination.
-- HTTPS is not decrypted, MITM'd, or routed through Lakebed.
+- HTTPS `CONNECT` requests are terminated locally with generated per-host certificates signed by the local CA, then relayed through Lakebed.
+- HTTPS is decrypted on your Mac before being sent through Lakebed, so certificate-pinned clients may fail.
 - HTTP responses are non-streaming and subject to Lakebed request and payload limits.
 
 ## Flags
