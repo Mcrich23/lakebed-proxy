@@ -51,6 +51,14 @@ networksetup -setsecurewebproxystate "Wi-Fi" off
 
 The CLI only prints these commands. It does not modify system proxy settings itself.
 
+If you want the CLI to manage Wi-Fi proxy settings while it runs, use `--auto`:
+
+```sh
+lakebed-proxy run --auto
+```
+
+`--auto` snapshots the current Wi-Fi HTTP and HTTPS proxy settings, sets both to the local `lakebed-proxy` listener, and restores the original settings on Ctrl-C or process shutdown. This mode requires the generated CA to already be trusted; if it is not trusted, the command exits before deploying or changing proxy settings.
+
 For HTTPS, the CLI also prints a command to trust its generated local CA:
 
 ```sh
@@ -77,3 +85,4 @@ lakebed-proxy run --host 127.0.0.1 --port 8081
 - `--host <host>`: bind host, default `127.0.0.1`
 - `--port <port>`: bind port, default `8080`
 - `--api <url>`: Lakebed API URL, default `https://api.lakebed.app`
+- `--auto`: automatically configure Wi-Fi web proxies while running and restore them on shutdown

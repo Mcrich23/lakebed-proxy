@@ -34,12 +34,13 @@ const HOP_BY_HOP_HEADERS = new Set([
 function usage(exitCode = 0) {
   const command = process.argv[1] ? `node ${process.argv[1]}` : "lakebed-proxy";
   console.log(`Usage:
-  lakebed-proxy run [--host 127.0.0.1] [--port 8080] [--api https://api.lakebed.app]
+  lakebed-proxy run [--host 127.0.0.1] [--port 8080] [--api https://api.lakebed.app] [--auto]
 
 Flags:
   --host <host>  Host to bind. Defaults to ${DEFAULT_HOST}.
   --port <port>  Port to bind. Defaults to ${DEFAULT_PORT}.
   --api <url>    Lakebed API URL. Defaults to ${DEFAULT_API}.
+  --auto         Configure Wi-Fi web proxies while running, then restore them on shutdown.
   --help         Show this help.
 
 GitHub:
@@ -115,8 +116,55 @@ function runCommand(command, args, { stdio = "pipe" } = {}) {
   });
 }
 
+async function runQuiet(command, args) {
+  try {
+    return await runCommand(command, args);
+  } catch (error) {
+    error.command = command;
+    error.args = args;
+    throw error;
+  }
+}
+
 async function runOpenSsl(args) {
   return runCommand("openssl", args);
+}
+
+async function caSha256Fingerprint() {
+  const { stdout } = await runOpenSsl(["x509", "-in", CA_CERT_PATH, "-noout", "-fingerprint", "-sha256"]);
+  return stdout.trim().replace(/^sha256 Fingerprint=/i, "").replaceAll(":", "").toUpperCase();
+}
+
+async function isCaTrusted() {
+  if (process.platform !== "darwin") {
+    return false;
+  }
+
+  const expected = await caSha256Fingerprint();
+  const keychains = ["/Library/Keychains/System.keychain", join(homedir(), "Library/Keychains/login.keychain-db")];
+  for (const keychain of keychains) {
+    try {
+      const { stdout } = await runQuiet("security", ["find-certificate", "-a", "-Z", "-c", "lakebed-proxy local MITM CA", keychain]);
+      const matches = stdout.match(/SHA-256 hash: ([A-Fa-f0-9]+)/g) || [];
+      if (matches.some((line) => line.replace(/^SHA-256 hash: /, "").toUpperCase() === expected)) {
+        return true;
+      }
+    } catch {
+      // Missing keychains or no matching cert just mean this CA is not trusted there.
+    }
+  }
+  return false;
+}
+
+async function assertCaTrustedForAuto() {
+  if (process.platform !== "darwin") {
+    throw new Error("--auto is only supported on macOS.");
+  }
+  if (!(await isCaTrusted())) {
+    throw new Error(
+      `--auto requires the generated HTTPS MITM CA to be trusted first.\n\nRun:\n  sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain ${quoteShell(CA_CERT_PATH)}\n\nThen rerun lakebed-proxy run --auto.`
+    );
+  }
 }
 
 async function runLakebed(args, { inherit = false } = {}) {
@@ -776,8 +824,102 @@ async function detectMacNetworkService() {
   return null;
 }
 
-async function printReadyInstructions({ deployId, deployUrl, urlChanged, host, port }) {
-  const service = await detectMacNetworkService();
+function parseNetworksetupProxy(output) {
+  const valueFor = (label) => output.match(new RegExp(`^${label}:\\s*(.*)$`, "m"))?.[1]?.trim() || "";
+  return {
+    authenticated: /^(1|yes)$/i.test(valueFor("Authenticated Proxy Enabled")),
+    enabled: /^yes$/i.test(valueFor("Enabled")),
+    port: valueFor("Port"),
+    server: valueFor("Server")
+  };
+}
+
+async function readWifiProxySettings() {
+  const [web, secureWeb] = await Promise.all([
+    runQuiet("networksetup", ["-getwebproxy", "Wi-Fi"]),
+    runQuiet("networksetup", ["-getsecurewebproxy", "Wi-Fi"])
+  ]);
+  return {
+    secureWeb: parseNetworksetupProxy(secureWeb.stdout),
+    web: parseNetworksetupProxy(web.stdout)
+  };
+}
+
+async function applyProxyKind(kind, settings) {
+  const command = kind === "secureWeb" ? "-setsecurewebproxy" : "-setwebproxy";
+  const stateCommand = kind === "secureWeb" ? "-setsecurewebproxystate" : "-setwebproxystate";
+  if (settings.server && settings.port) {
+    const args = ["Wi-Fi", settings.server, settings.port];
+    if (settings.authenticated) {
+      throw new Error("Cannot restore an authenticated Wi-Fi proxy because networksetup does not reveal its password.");
+    }
+    await runQuiet("networksetup", [command, ...args]);
+  }
+  await runQuiet("networksetup", [stateCommand, "Wi-Fi", settings.enabled ? "on" : "off"]);
+}
+
+async function applyAutoProxy({ host, port }) {
+  if (process.platform !== "darwin") {
+    throw new Error("--auto is only supported on macOS.");
+  }
+
+  const original = await readWifiProxySettings();
+  if (original.web.authenticated || original.secureWeb.authenticated) {
+    throw new Error("--auto cannot safely restore authenticated Wi-Fi proxy settings because macOS does not reveal proxy passwords.");
+  }
+
+  await runQuiet("networksetup", ["-setwebproxy", "Wi-Fi", host, String(port)]);
+  await runQuiet("networksetup", ["-setsecurewebproxy", "Wi-Fi", host, String(port)]);
+  await runQuiet("networksetup", ["-setwebproxystate", "Wi-Fi", "on"]);
+  await runQuiet("networksetup", ["-setsecurewebproxystate", "Wi-Fi", "on"]);
+  console.log("Configured Wi-Fi HTTP and HTTPS proxies for lakebed-proxy.");
+
+  let restored = false;
+  return async function restoreAutoProxy() {
+    if (restored) {
+      return;
+    }
+    restored = true;
+    console.log("\nRestoring original Wi-Fi proxy settings...");
+    await applyProxyKind("web", original.web);
+    await applyProxyKind("secureWeb", original.secureWeb);
+    console.log("Original Wi-Fi proxy settings restored.");
+  };
+}
+
+function installShutdownRestore(restore) {
+  let shuttingDown = false;
+  const shutdown = async (signalOrCode = 0) => {
+    if (shuttingDown) {
+      return;
+    }
+    shuttingDown = true;
+    try {
+      await restore();
+    } catch (error) {
+      console.error(`Failed to restore Wi-Fi proxy settings: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    process.exit(typeof signalOrCode === "number" ? signalOrCode : 0);
+  };
+
+  process.once("SIGINT", () => {
+    void shutdown(0);
+  });
+  process.once("SIGTERM", () => {
+    void shutdown(0);
+  });
+  process.once("uncaughtException", (error) => {
+    console.error(error);
+    void shutdown(1);
+  });
+  process.once("unhandledRejection", (error) => {
+    console.error(error);
+    void shutdown(1);
+  });
+}
+
+async function printReadyInstructions({ auto, deployId, deployUrl, urlChanged, host, port }) {
+  const service = auto ? "Wi-Fi" : await detectMacNetworkService();
   const serviceLabel = service || "<service>";
   const quotedService = quoteShell(serviceLabel);
 
@@ -792,19 +934,24 @@ async function printReadyInstructions({ deployId, deployUrl, urlChanged, host, p
   console.log("Trust the local CA for HTTPS MITM:");
   console.log(`  sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain ${quoteShell(CA_CERT_PATH)}`);
   console.log("");
-  if (!service) {
+  if (auto) {
+    console.log("--auto is enabled: Wi-Fi proxy settings were applied and will be restored on shutdown.");
+    console.log("");
+  } else if (!service) {
     console.log("I could not detect your active macOS network service. Replace <service> below with something like Wi-Fi.");
     console.log("List services with: networksetup -listallnetworkservices");
     console.log("");
   }
-  console.log("Enable macOS proxies:");
-  console.log(`  networksetup -setwebproxy ${quotedService} ${host} ${port}`);
-  console.log(`  networksetup -setsecurewebproxy ${quotedService} ${host} ${port}`);
-  console.log("");
-  console.log("Disable macOS proxies:");
-  console.log(`  networksetup -setwebproxystate ${quotedService} off`);
-  console.log(`  networksetup -setsecurewebproxystate ${quotedService} off`);
-  console.log("");
+  if (!auto) {
+    console.log("Enable macOS proxies:");
+    console.log(`  networksetup -setwebproxy ${quotedService} ${host} ${port}`);
+    console.log(`  networksetup -setsecurewebproxy ${quotedService} ${host} ${port}`);
+    console.log("");
+    console.log("Disable macOS proxies:");
+    console.log(`  networksetup -setwebproxystate ${quotedService} off`);
+    console.log(`  networksetup -setsecurewebproxystate ${quotedService} off`);
+    console.log("");
+  }
   console.log("HTTP and HTTPS requests go through Lakebed. HTTPS is decrypted locally with the generated CA.");
   console.log("Press Ctrl-C to stop the local proxy.");
 }
@@ -825,6 +972,7 @@ function readFlagValue(args, index, flag) {
 function parseRunOptions(args) {
   const options = {
     api: DEFAULT_API,
+    auto: false,
     host: DEFAULT_HOST,
     port: DEFAULT_PORT
   };
@@ -833,6 +981,11 @@ function parseRunOptions(args) {
     const arg = args[index];
     if (arg === "--help" || arg === "-h") {
       usage(0);
+    }
+    if (arg === "--auto") {
+      options.auto = true;
+      index += 1;
+      continue;
     }
     if (arg === "--host" || arg.startsWith("--host=")) {
       const parsed = readFlagValue(args, index, "--host");
@@ -871,16 +1024,30 @@ function parseRunOptions(args) {
 }
 
 async function run(options) {
-  const { api, host, port } = options;
+  const { api, auto, host, port } = options;
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
     throw new Error("--port must be a valid TCP port.");
   }
 
+  await ensureCa();
+  if (auto) {
+    await assertCaTrustedForAuto();
+  }
+
   const previousState = await readJson(STATE_PATH);
   const state = await ensureClaimedDeploy(previousState, api);
-  await ensureCa();
-  await startProxyServer({ host, port, deployUrl: state.url });
-  await printReadyInstructions({ deployId: state.deployId, deployUrl: state.url, urlChanged: state.urlChanged, host, port });
+  const server = await startProxyServer({ host, port, deployUrl: state.url });
+  let restore = null;
+  try {
+    restore = auto ? await applyAutoProxy({ host, port }) : null;
+  } catch (error) {
+    server.close();
+    throw error;
+  }
+  if (restore) {
+    installShutdownRestore(restore);
+  }
+  await printReadyInstructions({ auto, deployId: state.deployId, deployUrl: state.url, urlChanged: state.urlChanged, host, port });
 }
 
 async function main() {

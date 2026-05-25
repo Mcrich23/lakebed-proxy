@@ -26,6 +26,6 @@ pnpm dlx lakebed ...
 ## Constraints
 
 - Keep the public CLI small: the only public command is `run`; use flags for configuration.
-- Do not mutate macOS proxy settings automatically; print `networksetup` commands instead.
+- Only mutate macOS proxy settings when `run --auto` is used, and restore the original Wi-Fi settings on shutdown.
 - Plain HTTP goes through Lakebed.
 - HTTPS is MITM'd locally with a generated CA and then relayed through Lakebed.
