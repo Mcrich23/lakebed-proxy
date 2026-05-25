@@ -1,6 +1,6 @@
 {
   "name": "lakebed-proxy",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Run a local macOS-compatible HTTP proxy backed by a claimed Lakebed deployment.",
   "type": "module",
   "repository": {
