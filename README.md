@@ -18,7 +18,7 @@ Or with pnpm:
 pnpm dlx lakebed-proxy run
 ```
 
-On the first run, Lakebed will open a claim page in your browser. Claim the deployment, return to the terminal, and the proxy will finish starting.
+On the first run, Lakebed will open claim pages in your browser. Claim each deployment, return to the terminal, and the proxy will finish starting.
 
 ## HTTPS Setup
 
@@ -64,17 +64,35 @@ lakebed-proxy run --auto
 
 ```sh
 lakebed-proxy run [--host 127.0.0.1] [--port 8080] [--api https://api.lakebed.app] [--auto]
+lakebed-proxy run [--deployments 3] [--rotate-every 5]
 ```
 
 - `--host <host>`: local host to bind, default `127.0.0.1`
 - `--port <port>`: local port to bind, default `8080`
 - `--api <url>`: Lakebed API URL, default `https://api.lakebed.app`
+- `--deployments <count>`: Lakebed deployments to use, from `1` to `10`
+- `--rotate-every <count>`: send this many relayed requests through one deployment before rotating to the next, default `5`
 - `--auto`: set Wi-Fi web proxies while running and restore them on shutdown
+
+By default, `lakebed-proxy` starts with 3 deployments. If you later run with more slots, for example:
+
+```sh
+lakebed-proxy run --deployments 5
+```
+
+future runs without `--deployments` will keep using the 5 filled slots. To use fewer slots for a run:
+
+```sh
+lakebed-proxy run --deployments 2
+```
+
+Old slot folders are kept, so you can go back to the larger pool later.
 
 ## How It Works
 
-- Every run deploys or refreshes a generated Lakebed capsule in `~/.lakebed-proxy/capsule`.
-- The current Lakebed deployment URL is saved in `~/.lakebed-proxy/state.json`.
+- Every run deploys or refreshes generated Lakebed capsules in `~/.lakebed-proxy/deployments/slot-*/capsule`.
+- The current Lakebed deployment pool is saved in `~/.lakebed-proxy/state.json`.
+- Requests rotate through the active deployment pool in order.
 - HTTP requests are forwarded through Lakebed.
 - HTTPS requests are decrypted locally with your trusted `lakebed-proxy` CA, then forwarded through Lakebed.
 - If Lakebed returns a different deployment URL, the CLI tells you.

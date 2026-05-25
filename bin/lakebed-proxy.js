@@ -6,13 +6,17 @@ import net from "node:net";
 import tls from "node:tls";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { cp, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 8080;
 const DEFAULT_API = "https://api.lakebed.app";
+const DEFAULT_DEPLOYMENTS = 3;
+const DEFAULT_ROTATE_EVERY = 5;
+const MAX_DEPLOYMENTS = 10;
 const CACHE_DIR = join(homedir(), ".lakebed-proxy");
 const CAPSULE_DIR = join(CACHE_DIR, "capsule");
+const DEPLOYMENTS_DIR = join(CACHE_DIR, "deployments");
 const CA_DIR = join(CACHE_DIR, "ca");
 const CERTS_DIR = join(CA_DIR, "certs");
 const CA_KEY_PATH = join(CA_DIR, "lakebed-proxy-ca.key");
@@ -35,13 +39,16 @@ function usage(exitCode = 0) {
   const command = process.argv[1] ? `node ${process.argv[1]}` : "lakebed-proxy";
   console.log(`Usage:
   lakebed-proxy run [--host 127.0.0.1] [--port 8080] [--api https://api.lakebed.app] [--auto]
+  lakebed-proxy run [--deployments 3] [--rotate-every 5]
 
 Flags:
-  --host <host>  Host to bind. Defaults to ${DEFAULT_HOST}.
-  --port <port>  Port to bind. Defaults to ${DEFAULT_PORT}.
-  --api <url>    Lakebed API URL. Defaults to ${DEFAULT_API}.
-  --auto         Configure Wi-Fi web proxies while running, then restore them on shutdown.
-  --help         Show this help.
+  --host <host>          Host to bind. Defaults to ${DEFAULT_HOST}.
+  --port <port>          Port to bind. Defaults to ${DEFAULT_PORT}.
+  --api <url>            Lakebed API URL. Defaults to ${DEFAULT_API}.
+  --deployments <count>  Lakebed deployments to use, 1-${MAX_DEPLOYMENTS}. Defaults to ${DEFAULT_DEPLOYMENTS}, or existing filled slots.
+  --rotate-every <count> Rotate to the next deployment every N relayed requests. Defaults to ${DEFAULT_ROTATE_EVERY}.
+  --auto                 Configure Wi-Fi web proxies while running, then restore them on shutdown.
+  --help                 Show this help.
 
 GitHub:
   npx github:<owner>/lakebed-proxy run
@@ -185,68 +192,150 @@ async function runLakebed(args, { inherit = false } = {}) {
   return runCommand("npx", ["-y", "lakebed", ...args], { stdio });
 }
 
-async function deployCapsule(api) {
-  const { stdout } = await runLakebed(["deploy", CAPSULE_DIR, "--api", api, "--json"]);
+function slotCapsuleDir(slot) {
+  return join(DEPLOYMENTS_DIR, `slot-${slot}`, "capsule");
+}
+
+async function deployCapsule(api, capsuleDir) {
+  const { stdout } = await runLakebed(["deploy", capsuleDir, "--api", api, "--json"]);
   return JSON.parse(stdout);
 }
 
-async function claimStatus(api) {
-  const { stdout } = await runLakebed(["claim", CAPSULE_DIR, "--api", api, "--json"]);
+async function claimStatus(api, capsuleDir) {
+  const { stdout } = await runLakebed(["claim", capsuleDir, "--api", api, "--json"]);
   return JSON.parse(stdout);
 }
 
-async function openClaimFlow(api, claimUrl) {
+async function openClaimFlow(api, capsuleDir, claimUrl, slot) {
   console.log("\nThis Lakebed deploy must be claimed before it can proxy outbound HTTP.");
+  console.log(`Deployment slot: ${slot}`);
   console.log(`Claim URL: ${claimUrl}`);
   console.log("Opening the Lakebed claim page...");
   try {
-    await runLakebed(["claim", CAPSULE_DIR, "--api", api], { inherit: true });
+    await runLakebed(["claim", capsuleDir, "--api", api], { inherit: true });
   } catch (error) {
     console.log("Could not open the browser automatically. Open the claim URL above, then return here.");
   }
 }
 
-async function ensureClaimedDeploy(previousState, api) {
-  await writeGeneratedCapsule();
+function deploymentsFromState(state) {
+  if (Array.isArray(state?.deployments)) {
+    return state.deployments.filter((deployment) => Number.isInteger(deployment?.slot));
+  }
+  if (state?.url || state?.deployId) {
+    return [
+      {
+        claimed: state.claimed,
+        deployId: state.deployId,
+        slot: 1,
+        updatedAt: state.updatedAt,
+        url: state.url,
+        urlChanged: state.urlChanged
+      }
+    ];
+  }
+  return [];
+}
 
-  console.log("Deploying Lakebed proxy route...");
-  let deployed = await deployCapsule(api);
-  let changed = Boolean(previousState?.url && deployed.url && previousState.url !== deployed.url);
+async function filledSlotCount(previousState) {
+  const stateSlots = deploymentsFromState(previousState)
+    .filter((deployment) => deployment.url || deployment.deployId)
+    .map((deployment) => deployment.slot);
+  const dirSlots = [];
+  try {
+    const entries = await readdir(DEPLOYMENTS_DIR, { withFileTypes: true });
+    for (const entry of entries) {
+      const match = entry.isDirectory() ? entry.name.match(/^slot-(\d+)$/) : null;
+      if (match && (await fileExists(join(DEPLOYMENTS_DIR, entry.name, "capsule", ".lakebed", "deploy.json")))) {
+        dirSlots.push(Number(match[1]));
+      }
+    }
+  } catch {
+    // No deployments directory yet.
+  }
+  return Math.max(0, ...stateSlots, ...dirSlots);
+}
+
+async function migrateLegacyCapsuleToSlotOne() {
+  const legacyDeployPath = join(CAPSULE_DIR, ".lakebed", "deploy.json");
+  const slotDeployPath = join(slotCapsuleDir(1), ".lakebed", "deploy.json");
+  if ((await fileExists(slotDeployPath)) || !(await fileExists(legacyDeployPath))) {
+    return;
+  }
+  await mkdir(slotCapsuleDir(1), { recursive: true });
+  await cp(CAPSULE_DIR, slotCapsuleDir(1), { recursive: true });
+}
+
+function deploymentBySlot(previousState, slot) {
+  return deploymentsFromState(previousState).find((deployment) => deployment.slot === slot) || null;
+}
+
+async function ensureClaimedDeploymentSlot({ api, previousDeployment, slot }) {
+  const capsuleDir = slotCapsuleDir(slot);
+  await writeGeneratedCapsule(capsuleDir);
+
+  console.log(`Deploying Lakebed proxy route slot ${slot}...`);
+  let deployed = await deployCapsule(api, capsuleDir);
+  let changed = Boolean(previousDeployment?.url && deployed.url && previousDeployment.url !== deployed.url);
   if (changed) {
-    console.log(`Lakebed proxy URL changed: ${previousState.url} -> ${deployed.url}`);
+    console.log(`Lakebed proxy URL changed for slot ${slot}: ${previousDeployment.url} -> ${deployed.url}`);
   }
 
   let finalDeploy = deployed;
   if (deployed.claimRequired || !deployed.claimed) {
-    const claim = await claimStatus(api);
+    const claim = await claimStatus(api, capsuleDir);
     if (!claim.claimed) {
-      await openClaimFlow(api, claim.claimUrl || deployed.claimUrl);
-      console.log("Waiting for Lakebed claim to complete...");
+      await openClaimFlow(api, capsuleDir, claim.claimUrl || deployed.claimUrl, slot);
+      console.log(`Waiting for Lakebed claim to complete for slot ${slot}...`);
       for (;;) {
-        const status = await claimStatus(api);
+        const status = await claimStatus(api, capsuleDir);
         if (status.claimed) {
-          console.log("Lakebed deploy claimed.");
+          console.log(`Lakebed deploy slot ${slot} claimed.`);
           break;
         }
         await sleep(3000);
       }
     }
 
-    console.log("Redeploying claimed Lakebed proxy route so outbound fetch is enabled...");
-    finalDeploy = await deployCapsule(api);
-    if (previousState?.url && finalDeploy.url && previousState.url !== finalDeploy.url && !changed) {
+    console.log(`Redeploying claimed Lakebed proxy route slot ${slot} so outbound fetch is enabled...`);
+    finalDeploy = await deployCapsule(api, capsuleDir);
+    if (previousDeployment?.url && finalDeploy.url && previousDeployment.url !== finalDeploy.url && !changed) {
       changed = true;
-      console.log(`Lakebed proxy URL changed: ${previousState.url} -> ${finalDeploy.url}`);
+      console.log(`Lakebed proxy URL changed for slot ${slot}: ${previousDeployment.url} -> ${finalDeploy.url}`);
     }
   }
 
-  const state = {
-    api,
+  return {
     claimed: Boolean(finalDeploy.claimed ?? true),
     deployId: finalDeploy.deployId,
+    slot,
     updatedAt: nowIso(),
     url: finalDeploy.url,
     urlChanged: changed
+  };
+}
+
+async function ensureClaimedDeployments({ api, deploymentCount, previousState, rotateEvery }) {
+  await migrateLegacyCapsuleToSlotOne();
+  const deployments = [];
+  for (let slot = 1; slot <= deploymentCount; slot += 1) {
+    deployments.push(
+      await ensureClaimedDeploymentSlot({
+        api,
+        previousDeployment: deploymentBySlot(previousState, slot),
+        slot
+      })
+    );
+  }
+
+  const state = {
+    activeDeploymentCount: deploymentCount,
+    api,
+    deployments,
+    rotation: {
+      rotateEvery
+    },
+    updatedAt: nowIso()
   };
   await writeJson(STATE_PATH, state);
   return state;
@@ -406,17 +495,17 @@ function capsuleClientSource() {
 `;
 }
 
-async function writeGeneratedCapsule() {
-  await mkdir(join(CAPSULE_DIR, "server"), { recursive: true });
-  await mkdir(join(CAPSULE_DIR, "client"), { recursive: true });
-  await writeFile(join(CAPSULE_DIR, "server", "index.ts"), capsuleServerSource());
-  await writeFile(join(CAPSULE_DIR, "client", "index.tsx"), capsuleClientSource());
+async function writeGeneratedCapsule(capsuleDir) {
+  await mkdir(join(capsuleDir, "server"), { recursive: true });
+  await mkdir(join(capsuleDir, "client"), { recursive: true });
+  await writeFile(join(capsuleDir, "server", "index.ts"), capsuleServerSource());
+  await writeFile(join(capsuleDir, "client", "index.tsx"), capsuleClientSource());
   await writeFile(
-    join(CAPSULE_DIR, "AGENTS.md"),
+    join(capsuleDir, "AGENTS.md"),
     "# Generated Lakebed Proxy Capsule\n\nThis directory is managed by `lakebed-proxy run`. Do not edit it by hand.\n"
   );
   await writeFile(
-    join(CAPSULE_DIR, "README.md"),
+    join(capsuleDir, "README.md"),
     "# Generated Lakebed Proxy Capsule\n\nThis capsule exposes the server-side relay route used by the local lakebed-proxy CLI.\n"
   );
 }
@@ -591,7 +680,7 @@ async function ensureHostCert(host) {
   return { cert: await readFile(certPath), key: await readFile(keyPath) };
 }
 
-async function relayRequestThroughLakebed({ bodyMaxBytes, lakebedClient, protocol, req, res, targetHost }) {
+async function relayRequestThroughLakebed({ bodyMaxBytes, lakebedPool, protocol, req, res, targetHost }) {
   const started = Date.now();
   const target = protocol === "https:" ? new URL(req.url || "/", `https://${targetHost}`) : parseProxyTarget(req);
   if (!target) {
@@ -601,7 +690,7 @@ async function relayRequestThroughLakebed({ bodyMaxBytes, lakebedClient, protoco
 
   try {
     const body = await collectRequestBody(req, bodyMaxBytes);
-    const result = await lakebedClient.runMutation("relay", [
+    const { deployment, result } = await lakebedPool.runMutation("relay", [
       {
         method: req.method,
         url: target.toString(),
@@ -612,7 +701,7 @@ async function relayRequestThroughLakebed({ bodyMaxBytes, lakebedClient, protoco
     const responseBody = base64ToBuffer(result.bodyBase64);
     res.writeHead(Number(result.status) || 502, result.statusText || undefined, responseHeadersFromRelay(result.headers, responseBody));
     res.end(responseBody);
-    console.log(`${req.method} ${target} -> ${result.status}${result.error ? ` ${result.error}` : ""} ${Date.now() - started}ms lakebed`);
+    console.log(`${req.method} ${target} -> ${result.status}${result.error ? ` ${result.error}` : ""} ${Date.now() - started}ms lakebed[${deployment.index}/${deployment.total}]`);
   } catch (error) {
     const message = error instanceof Error ? error.message : "Lakebed relay failed.";
     writePlain(res, 502, `${message}\n`);
@@ -722,10 +811,51 @@ class LakebedMutationClient {
   }
 }
 
-async function handleHttpProxy(req, res, lakebedClient) {
+class LakebedDeploymentPool {
+  constructor(deployments, rotateEvery) {
+    this.deployments = deployments.map((deployment, index) => ({
+      ...deployment,
+      client: new LakebedMutationClient(deployment.url),
+      index: index + 1,
+      total: deployments.length
+    }));
+    this.rotateEvery = rotateEvery;
+    this.requestCount = 0;
+  }
+
+  selectDeploymentForCount(count, offset = 0) {
+    const batch = Math.floor(count / this.rotateEvery);
+    return this.deployments[(batch + offset) % this.deployments.length];
+  }
+
+  async runMutation(name, args) {
+    if (this.deployments.length === 0) {
+      throw new Error("No Lakebed deployments are available.");
+    }
+
+    const requestIndex = this.requestCount;
+    const primary = this.selectDeploymentForCount(requestIndex);
+    this.requestCount += 1;
+    try {
+      return { deployment: primary, result: await primary.client.runMutation(name, args) };
+    } catch (error) {
+      if (this.deployments.length === 1) {
+        throw error;
+      }
+      const fallback = this.selectDeploymentForCount(requestIndex, 1);
+      try {
+        return { deployment: fallback, result: await fallback.client.runMutation(name, args) };
+      } catch {
+        throw error;
+      }
+    }
+  }
+}
+
+async function handleHttpProxy(req, res, lakebedPool) {
   await relayRequestThroughLakebed({
     bodyMaxBytes: 2 * 1024 * 1024,
-    lakebedClient,
+    lakebedPool,
     protocol: "http:",
     req,
     res,
@@ -781,13 +911,13 @@ async function handleConnect(req, clientSocket, head, mitmHttpServer) {
   }
 }
 
-function startProxyServer({ host, port, deployUrl }) {
-  const lakebedClient = new LakebedMutationClient(deployUrl);
+function startProxyServer({ deployments, host, port, rotateEvery }) {
+  const lakebedPool = new LakebedDeploymentPool(deployments, rotateEvery);
   const mitmHttpServer = createServer((req, res) => {
     const targetHost = req.socket.lakebedProxyTargetHost;
     void relayRequestThroughLakebed({
       bodyMaxBytes: 2 * 1024 * 1024,
-      lakebedClient,
+      lakebedPool,
       protocol: "https:",
       req,
       res,
@@ -795,7 +925,7 @@ function startProxyServer({ host, port, deployUrl }) {
     });
   });
   const server = createServer((req, res) => {
-    void handleHttpProxy(req, res, lakebedClient);
+    void handleHttpProxy(req, res, lakebedPool);
   });
   server.on("connect", (req, socket, head) => {
     void handleConnect(req, socket, head, mitmHttpServer);
@@ -932,15 +1062,18 @@ function installShutdownRestore(restore) {
   });
 }
 
-async function printReadyInstructions({ auto, deployId, deployUrl, urlChanged, host, port }) {
+async function printReadyInstructions({ auto, deployments, host, port, rotateEvery }) {
   const service = auto ? "Wi-Fi" : await detectMacNetworkService();
   const serviceLabel = service || "<service>";
   const quotedService = quoteShell(serviceLabel);
 
   console.log("\nLakebed proxy is serving.");
-  console.log(`Deploy ID:  ${deployId}`);
-  console.log(`Deploy URL: ${deployUrl}`);
-  console.log(`URL changed this run: ${urlChanged ? "yes" : "no"}`);
+  console.log(`Deployments: ${deployments.length}`);
+  for (const deployment of deployments) {
+    console.log(`  ${deployment.slot}. ${deployment.deployId || "<unknown deploy id>"} ${deployment.url}`);
+    console.log(`     URL changed this run: ${deployment.urlChanged ? "yes" : "no"}`);
+  }
+  console.log(`Rotation: every ${rotateEvery} relayed request${rotateEvery === 1 ? "" : "s"}`);
   console.log("");
   console.log(`HTTP Proxy:  ${host}:${port}`);
   console.log(`HTTPS Proxy: ${host}:${port}`);
@@ -987,8 +1120,10 @@ function parseRunOptions(args) {
   const options = {
     api: DEFAULT_API,
     auto: false,
+    deploymentCount: null,
     host: DEFAULT_HOST,
-    port: DEFAULT_PORT
+    port: DEFAULT_PORT,
+    rotateEvery: DEFAULT_ROTATE_EVERY
   };
 
   for (let index = 0; index < args.length;) {
@@ -1027,6 +1162,26 @@ function parseRunOptions(args) {
       index += parsed.consumed;
       continue;
     }
+    if (arg === "--deployments" || arg.startsWith("--deployments=")) {
+      const parsed = readFlagValue(args, index, "--deployments");
+      const deploymentCount = Number(parsed.value);
+      if (!Number.isInteger(deploymentCount) || deploymentCount < 1 || deploymentCount > MAX_DEPLOYMENTS) {
+        throw new Error(`--deployments must be an integer from 1 to ${MAX_DEPLOYMENTS}.`);
+      }
+      options.deploymentCount = deploymentCount;
+      index += parsed.consumed;
+      continue;
+    }
+    if (arg === "--rotate-every" || arg.startsWith("--rotate-every=")) {
+      const parsed = readFlagValue(args, index, "--rotate-every");
+      const rotateEvery = Number(parsed.value);
+      if (!Number.isInteger(rotateEvery) || rotateEvery < 1) {
+        throw new Error("--rotate-every must be a positive integer.");
+      }
+      options.rotateEvery = rotateEvery;
+      index += parsed.consumed;
+      continue;
+    }
     throw new Error(`Unknown option: ${arg}`);
   }
 
@@ -1037,8 +1192,15 @@ function parseRunOptions(args) {
   return options;
 }
 
+async function resolveDeploymentCount({ requestedCount, previousState }) {
+  if (requestedCount !== null) {
+    return requestedCount;
+  }
+  return Math.min(MAX_DEPLOYMENTS, Math.max(DEFAULT_DEPLOYMENTS, await filledSlotCount(previousState)));
+}
+
 async function run(options) {
-  const { api, auto, host, port } = options;
+  const { api, auto, host, port, rotateEvery } = options;
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
     throw new Error("--port must be a valid TCP port.");
   }
@@ -1049,8 +1211,16 @@ async function run(options) {
   }
 
   const previousState = await readJson(STATE_PATH);
-  const state = await ensureClaimedDeploy(previousState, api);
-  const server = await startProxyServer({ host, port, deployUrl: state.url });
+  const deploymentCount = await resolveDeploymentCount({
+    previousState,
+    requestedCount: options.deploymentCount
+  });
+  const state = await ensureClaimedDeployments({ api, deploymentCount, previousState, rotateEvery });
+  const activeDeployments = state.deployments.filter((deployment) => deployment.url);
+  if (activeDeployments.length === 0) {
+    throw new Error("No Lakebed deployment URLs were returned.");
+  }
+  const server = await startProxyServer({ deployments: activeDeployments, host, port, rotateEvery });
   let restore = null;
   try {
     restore = auto ? await applyAutoProxy({ host, port }) : null;
@@ -1061,7 +1231,7 @@ async function run(options) {
   if (restore) {
     installShutdownRestore(restore);
   }
-  await printReadyInstructions({ auto, deployId: state.deployId, deployUrl: state.url, urlChanged: state.urlChanged, host, port });
+  await printReadyInstructions({ auto, deployments: activeDeployments, host, port, rotateEvery });
 }
 
 async function main() {
