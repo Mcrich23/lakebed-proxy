@@ -4,7 +4,7 @@
   "description": "Run a local macOS-compatible HTTP proxy backed by a claimed Lakebed deployment.",
   "type": "module",
   "bin": {
-    "lakebed-proxy": "./bin/lakebed-proxy.js"
+    "lakebed-proxy": "bin/lakebed-proxy.js"
   },
   "files": [
     "bin"
