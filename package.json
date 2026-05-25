@@ -3,6 +3,14 @@
   "version": "0.2.0",
   "description": "Run a local macOS-compatible HTTP proxy backed by a claimed Lakebed deployment.",
   "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Mcrich23/lakebed-proxy.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Mcrich23/lakebed-proxy/issues"
+  },
+  "homepage": "https://github.com/Mcrich23/lakebed-proxy#readme",
   "bin": {
     "lakebed-proxy": "bin/lakebed-proxy.js"
   },
